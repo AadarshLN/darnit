@@ -33,6 +33,12 @@ Thumbs.db
 project.toml
 !example.*.toml
 !example.*.yaml
+# Test fixtures with tracked .baseline.toml. The top-level rule above
+# would otherwise strip them and CI would either deselect the whole
+# suite (parity) or auto-pick a different framework than the fixture
+# expects (harness).
+!tests/darnit/harness/fixtures/**/.baseline.toml
+!tests/darnit/parity/fixtures/**/.baseline.toml
 
 # Logs
 *.log
@@ -47,3 +53,6 @@ baseline-test-repo/
 .doc-cache/
 
 .darnit/
+
+# Feature 028: Tier 2 parity check writes skill-invocation transcripts here.
+parity-artifacts/

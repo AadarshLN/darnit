@@ -727,6 +727,154 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     return 1 if failed else 0
 
+def cmd_harness(args: argparse.Namespace) -> int:
+    """Run the harness: end-to-end audit with in-band LLM dispatch.
+
+    Feature 026. Non-interactive by default; consumes ANTHROPIC_API_KEY
+    from env; dispatches LLM steps via PydanticAILLMStep; produces a
+    Markdown or JSON report; exits with a documented code.
+    """
+    import asyncio
+    import sys
+
+    from darnit.core.llm_step import PydanticAILLMStep
+    from darnit.harness.answer_sources import AnswerSourceLoadError
+    from darnit.harness.driver import (
+        HarnessRun,
+        HarnessRunTimeout,
+        HarnessSetupError,
+    )
+    from darnit.harness.exit_codes import HarnessExitCode
+
+    repo_path = str(Path(args.repo_path).resolve())
+    output_format = getattr(args, "format", "markdown")
+    output_path = getattr(args, "output", None)
+    answers_path = getattr(args, "answers", None)
+    interactive = getattr(args, "interactive", False)
+    per_resolver_timeout_s = getattr(args, "per_resolver_timeout", None)
+
+    # Feature 027: --interactive fail-fast guard (IR-7..IR-9 / SC-005).
+    # Must run BEFORE any control iteration so a CI misfire never silently
+    # skips every question.
+    if interactive:
+        if not sys.stdin.isatty():
+            _emit_exit_summary(
+                "setup_error, interactive channel unavailable "
+                "(stdin is not a TTY)",
+                HarnessExitCode.SETUP_ERROR,
+            )
+            return int(HarnessExitCode.SETUP_ERROR)
+        try:
+            _tty_probe = open("/dev/tty", "r+", buffering=1)  # noqa: SIM115
+            _tty_probe.close()
+        except OSError as exc:
+            _emit_exit_summary(
+                "setup_error, interactive channel unavailable "
+                f"(/dev/tty not openable: {exc.strerror or type(exc).__name__})",
+                HarnessExitCode.SETUP_ERROR,
+            )
+            return int(HarnessExitCode.SETUP_ERROR)
+
+    # Build the resolver via the explicit factory. Any AnswerSourceLoadError
+    # from a bad --answers file surfaces as a SETUP_ERROR.
+    try:
+        resolver = HarnessRun.build_default_resolver(
+            local_path=repo_path,
+            answers_path=answers_path,
+        )
+    except AnswerSourceLoadError as exc:
+        _emit_exit_summary(f"setup_error, {exc}", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+    except FileNotFoundError as exc:
+        _emit_exit_summary(f"setup_error, {exc}", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+
+    # Feature 027: build the QuestionResolver chain via entry-point discovery.
+    # PR #367 review Constitution IV fix: external resolvers stay out of the
+    # chain unless --allow-external-resolvers is set. An answer they produce
+    # is recorded with authority="asserted", so silent invocation would let
+    # any installed third-party package produce dispositive-strength values
+    # without operator opt-in.
+    allow_external_resolvers = getattr(args, "allow_external_resolvers", False)
+    try:
+        question_resolvers = HarnessRun.build_default_resolver_chain(
+            interactive=interactive,
+            allow_external_resolvers=allow_external_resolvers,
+        )
+    except HarnessSetupError as exc:
+        _emit_exit_summary(f"setup_error, {exc}", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+
+    if question_resolvers:
+        harness_logger = get_logger("harness")
+        harness_logger.info(
+            "harness: resolvers configured: %s",
+            [getattr(r, "name", "unknown") for r in question_resolvers],
+        )
+
+    run = HarnessRun(
+        local_path=repo_path,
+        framework_name=getattr(args, "framework", None),
+        level=getattr(args, "level", 3),
+        answer_resolver=resolver,
+        llm_step=PydanticAILLMStep(),
+        per_call_timeout_s=getattr(args, "per_call_timeout", 60),
+        total_run_timeout_s=getattr(args, "total_run_timeout", 900),
+        question_resolvers=question_resolvers,
+        per_resolver_timeout_s=per_resolver_timeout_s,
+    )
+
+    try:
+        report = asyncio.run(run.run())
+    except HarnessSetupError as exc:
+        _emit_exit_summary(f"setup_error, {exc}", HarnessExitCode.SETUP_ERROR)
+        return int(HarnessExitCode.SETUP_ERROR)
+    except HarnessRunTimeout as exc:
+        _emit_exit_summary(f"internal_error, {exc}", HarnessExitCode.INTERNAL_ERROR)
+        return int(HarnessExitCode.INTERNAL_ERROR)
+    except Exception as exc:
+        _emit_exit_summary(
+            f"internal_error, {type(exc).__name__}: {exc}",
+            HarnessExitCode.INTERNAL_ERROR,
+        )
+        return int(HarnessExitCode.INTERNAL_ERROR)
+
+    # Render the report
+    if output_format == "json":
+        text = report.to_json()
+    else:
+        text = report.to_markdown()
+
+    if output_path:
+        Path(output_path).write_text(text, encoding="utf-8")
+    else:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+
+    # Exit summary. Order matches CLI-13 exactly:
+    #   `complete, <P> PASS, <F> FAIL, <W> WARN, <PEND> pending, exit <N>`
+    # so CI parsers written against the contract keep working. Answered
+    # count is appended AFTER `pending`; the CLI-13 grep pattern is a
+    # prefix match on positional fields, so the extra trailing field is
+    # additive rather than positional-shifting. PR #367 review fix.
+    s = report.summary
+    answered_count = len(report.answered_feedback)
+    pending_count = len(report.pending_feedback)
+    _emit_exit_summary(
+        f"complete, {s.pass_} PASS, {s.fail} FAIL, {s.warn} WARN, "
+        f"{pending_count} pending, {answered_count} answered",
+        HarnessExitCode(report.exit_class),
+    )
+    return report.exit_class
+
+
+def _emit_exit_summary(reason: str, exit_code: int) -> None:
+    """Emit the one-line stderr summary before process exit (contract CLI-13)."""
+    harness_logger = get_logger("harness")
+    harness_logger.info("harness: %s, exit %d", reason, int(exit_code))
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Start the MCP server.
 
@@ -1037,6 +1185,94 @@ def create_parser() -> argparse.ArgumentParser:
              "auto (interactive if terminal, noninteractive in CI)",
     )
     run_parser.set_defaults(func=cmd_run)
+
+    # harness command (feature 026)
+    harness_parser = subparsers.add_parser(
+        "harness",
+        help="Run end-to-end audit with in-band LLM dispatch (fleet-operator driver).",
+        description=(
+            "End-to-end audit driver with in-band LLM dispatch. Reads "
+            "ANTHROPIC_API_KEY from env; dispatches LLM steps itself so "
+            "no control ends up PENDING_LLM in the report. Non-interactive; "
+            "batch answers via --answers or auto-discovered .project/project.yaml."
+        ),
+    )
+    harness_parser.add_argument(
+        "repo_path",
+        help="Path to the target repository",
+    )
+    harness_parser.add_argument(
+        "--framework",
+        help="Framework name (e.g., openssf-baseline). Overrides .baseline.toml.",
+    )
+    harness_parser.add_argument(
+        "--level",
+        type=int,
+        choices=[1, 2, 3],
+        default=3,
+        help="Maximum maturity level to audit (default: 3)",
+    )
+    harness_parser.add_argument(
+        "--answers",
+        help=(
+            "Path to YAML/JSON file with pre-declared context answers. "
+            "Overrides values in .project/project.yaml for the run."
+        ),
+    )
+    harness_parser.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Report format (default: markdown)",
+    )
+    harness_parser.add_argument(
+        "--output",
+        help="Write report to this path; without it, stdout carries the report.",
+    )
+    harness_parser.add_argument(
+        "--per-call-timeout",
+        type=int,
+        default=60,
+        help="Per-LLM-call timeout in seconds (default: 60)",
+    )
+    harness_parser.add_argument(
+        "--total-run-timeout",
+        type=int,
+        default=900,
+        help="Total audit-run timeout in seconds (default: 900 = 15 min)",
+    )
+    harness_parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help=(
+            "Prompt the operator at the terminal for any pending feedback "
+            "question not covered by --answers or .project/project.yaml. "
+            "Requires stdin to be a TTY and /dev/tty to be openable; fails "
+            "fast with exit 2 otherwise."
+        ),
+    )
+    harness_parser.add_argument(
+        "--per-resolver-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-resolver timeout in seconds. Default: no timeout. "
+            "Setting a global bound is usually inappropriate (an operator at "
+            "a terminal cannot be on the same clock as a webhook resolver)."
+        ),
+    )
+    harness_parser.add_argument(
+        "--allow-external-resolvers",
+        action="store_true",
+        help=(
+            "Include third-party question resolvers registered under the "
+            "`darnit.question_resolvers` entry-point group. Off by default: "
+            "external resolvers produce authority='asserted' values, so "
+            "silently including them would violate Constitution Principle IV "
+            "(only human confirmation may assert)."
+        ),
+    )
+    harness_parser.set_defaults(func=cmd_harness)
 
     # install command
     install_parser = subparsers.add_parser(

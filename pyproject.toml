@@ -51,6 +51,18 @@ dev = [
     "pre-commit>=4.0.0",
     "vulture>=2.11",
 ]
+# Feature 028 Tier 2 (PR #370): the coding-agent parity check imports
+# `claude_agent_sdk` (~90 MB). Isolate it here so `darnit-mcp[dev]`
+# stays lean -- Tier 2 CI installs `darnit-mcp[parity-tier2]`
+# explicitly. Not part of `[dev]` per PR #370 review feedback.
+parity-tier2 = [
+    "claude-agent-sdk>=0.1.0",
+    # Feature 029: Tier 2 parity check adds an OpenAI backend alongside the
+    # Claude Agent SDK path. TEST-ONLY dep; MUST NOT appear in any darnit
+    # product package's pyproject.toml (SC-006). Pinned >=1.50 for the
+    # Chat Completions tool-calling surface used by openai_backend.py.
+    "openai>=1.50",
+]
 
 [tool.uv.workspace]
 members = ["packages/*"]
@@ -62,6 +74,7 @@ darnit-example = { workspace = true }
 darnit-gittuf = { workspace = true }
 darnit-reproducibility = { workspace = true }
 darnit-hello = { workspace = true }
+darnit-testchecks = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -101,11 +114,12 @@ dev = [
     "skills-ref>=0.1.1",
     "jsonschema>=4.26.0",
     "syrupy>=4.0.0",  # snapshot testing for threat-model rendering (014-cobra-threat-model R8)
-    # Internal/test-only workspace packages — not published to PyPI. Pinned here
+    # Internal/test-only workspace packages -- not published to PyPI. Pinned here
     # so they install for development and tests via `uv sync`, but do not become
     # runtime dependencies of any published wheel.
     "darnit-example",
     "darnit-hello",
+    "darnit-testchecks",  # framework used by tests/darnit/cli/ (feature 024)
 ]
 
 [tool.mypy]
